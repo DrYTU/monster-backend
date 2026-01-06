@@ -241,19 +241,35 @@ app.post('/user/:userId/hell-week', async (req, res) => {
 
         if (action === 'start') {
             if (user.hellWeek.isActive) return res.status(400).json({ error: 'Already in hell' });
+            if ((user.level || 1) < 4) return res.status(400).json({ error: 'Hell Week requires Level 4' });
 
             user.hellWeek = {
                 isActive: true,
                 startDate: new Date(),
                 targetDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
             };
+            await user.save();
             res.json({ message: 'Welcome to Hell.', hellWeek: user.hellWeek });
         } else if (action === 'surrender') {
+            // Early exit - biggest penalty
+            user.hellWeek = { isActive: false };
+            user.platformXp = Math.max(0, user.platformXp - 700);
+            await user.save();
+            res.json({ message: 'You gave up early. Coward.', user });
+        } else if (action === 'fail') {
+            // Completed 7 days but didn't do all habits - medium penalty
             user.hellWeek = { isActive: false };
             user.platformXp = Math.max(0, user.platformXp - 500);
-            res.json({ message: 'You gave up. Shame.', user });
+            await user.save();
+            res.json({ message: 'You survived but failed. Shame.', user });
+        } else if (action === 'complete') {
+            // Successfully completed all habits for 7 days - big reward
+            user.hellWeek = { isActive: false };
+            user.platformXp = (user.platformXp || 0) + 1000;
+            user.level = Math.max(user.level || 1, calculateLevel(user.platformXp));
+            await user.save();
+            res.json({ message: 'You conquered Hell. Legendary.', user });
         }
-        await user.save();
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -512,6 +528,43 @@ app.post('/battles/respond', async (req, res) => {
             }
             res.json({ message: 'Battle Rejected' });
         }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Surrender Battle
+app.post('/battles/surrender', async (req, res) => {
+    const { habitId } = req.body;
+    try {
+        const myHabit = await Habit.findById(habitId);
+        if (!myHabit) return res.status(404).json({ error: 'Habit not found' });
+
+        const opponentHabit = await Habit.findOne({
+            sharedGroupId: myHabit.sharedGroupId,
+            _id: { $ne: myHabit._id }
+        });
+
+        // Current user surrenders, so myHabit loses
+        myHabit.battleStatus = 'completed';
+        myHabit.battleWinner = myHabit.partnerId; // Partner wins
+
+        if (opponentHabit) {
+            opponentHabit.battleStatus = 'completed';
+            opponentHabit.battleWinner = myHabit.partnerId; // Opponent is the winner
+            await opponentHabit.save();
+        }
+
+        await myHabit.save();
+
+        // Also add penalty to user (optional, but requested for Hell Week? No, this is for battles)
+        const user = await User.findById(myHabit.userId);
+        if (user) {
+            user.platformXp = Math.max(0, (user.platformXp || 0) - 100); // 100 XP penalty for surrendering a battle
+            await user.save();
+        }
+
+        res.json({ message: 'You surrendered. Rival wins.', habit: myHabit, user });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
