@@ -111,6 +111,7 @@ app.post('/habits', async (req, res) => {
             sharedGroupId,
             type: partnerId ? 'battle' : 'solo',
             battleStatus: partnerId ? 'waiting' : 'active',
+            isVisible: partnerId ? false : true, // Hide until accepted
             battleDuration: battleDuration || 7
         });
         await habit.save();
@@ -139,20 +140,51 @@ app.post('/habits', async (req, res) => {
 app.post('/habits/:id/toggle', async (req, res) => {
     const { date } = req.body;
     const { id } = req.params;
+    const UNDO_WINDOW_MS = 60 * 1000; // 60 seconds undo window
 
     try {
         const habit = await Habit.findById(id);
         if (!habit) return res.status(404).json({ error: 'Not found' });
 
+        // Initialize xpGrantedDates if not exists (for backward compatibility)
+        if (!habit.xpGrantedDates) {
+            habit.xpGrantedDates = [];
+        }
+
         const existsIndex = habit.completedDates.indexOf(date);
+        const xpGrantEntry = habit.xpGrantedDates.find(entry =>
+            typeof entry === 'object' ? entry.date === date : entry === date
+        );
         let xpChange = 0;
 
         if (existsIndex > -1) {
+            // Unchecking - remove from completed dates
             habit.completedDates.splice(existsIndex, 1);
-            xpChange = -15;
+
+            // Check if within undo window (60 seconds)
+            if (xpGrantEntry) {
+                const grantedAt = xpGrantEntry.grantedAt ? new Date(xpGrantEntry.grantedAt) : null;
+                const now = new Date();
+
+                if (grantedAt && (now - grantedAt) < UNDO_WINDOW_MS) {
+                    // Within undo window - refund XP
+                    xpChange = -15;
+                    // Remove from xpGrantedDates
+                    habit.xpGrantedDates = habit.xpGrantedDates.filter(entry =>
+                        typeof entry === 'object' ? entry.date !== date : entry !== date
+                    );
+                }
+                // If outside undo window, no XP change (keeps the XP but removes completion)
+            }
         } else {
+            // Checking - add to completed dates
             habit.completedDates.push(date);
-            xpChange = 15;
+
+            // Only grant XP if this date hasn't been granted before
+            if (!xpGrantEntry) {
+                xpChange = 15;
+                habit.xpGrantedDates.push({ date, grantedAt: new Date() });
+            }
         }
 
         habit.completedDates.sort();
@@ -161,13 +193,13 @@ app.post('/habits/:id/toggle', async (req, res) => {
         await habit.save();
 
         const user = await User.findById(habit.userId);
-        if (user) {
+        if (user && xpChange !== 0) {
             if (user.hellWeek?.isActive) {
                 xpChange = xpChange > 0 ? (xpChange + 20) : (xpChange - 20);
             }
 
             user.platformXp = Math.max(0, (user.platformXp || 0) + xpChange);
-            user.level = calculateLevel(user.platformXp);
+            user.level = Math.max(user.level || 1, calculateLevel(user.platformXp));
 
             await user.save();
         }
@@ -238,8 +270,9 @@ app.get('/user/:id', async (req, res) => {
         }
 
         const calculatedLevel = calculateLevel(user.platformXp || 0);
-        if (user.level !== calculatedLevel) {
-            console.log(`Fixing user level mismatch: ${user.level} -> ${calculatedLevel} for XP ${user.platformXp}`);
+        // Only increase level, never decrease (level is permanent once earned)
+        if (calculatedLevel > (user.level || 1)) {
+            console.log(`Leveling up user: ${user.level} -> ${calculatedLevel} for XP ${user.platformXp}`);
             user.level = calculatedLevel;
             await user.save();
         }
@@ -405,6 +438,43 @@ app.get('/battles/requests', async (req, res) => {
     }
 });
 
+// Get Sent Battle Requests (waiting for acceptance)
+app.get('/battles/sent', async (req, res) => {
+    const { userId } = req.query;
+    try {
+        const sent = await Habit.find({
+            userId,
+            battleStatus: 'waiting',
+            type: 'battle'
+        }).populate('partnerId', 'email level');
+        res.json(sent);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Cancel Sent Battle Request
+app.post('/battles/cancel', async (req, res) => {
+    const { habitId } = req.body;
+    try {
+        const myHabit = await Habit.findById(habitId);
+        if (!myHabit) return res.status(404).json({ error: 'Battle not found' });
+
+        // Delete partner's pending habit
+        await Habit.deleteOne({
+            sharedGroupId: myHabit.sharedGroupId,
+            _id: { $ne: myHabit._id }
+        });
+
+        // Delete my waiting habit
+        await Habit.findByIdAndDelete(habitId);
+
+        res.json({ message: 'Battle request cancelled' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Respond to Battle Request
 app.post('/battles/respond', async (req, res) => {
     const { habitId, action } = req.body;
@@ -425,6 +495,7 @@ app.post('/battles/respond', async (req, res) => {
 
             if (opponentHabit) {
                 opponentHabit.battleStatus = 'active';
+                opponentHabit.isVisible = true; // Show in Home screen
                 opponentHabit.battleStartDate = startDate;
                 await opponentHabit.save();
             }

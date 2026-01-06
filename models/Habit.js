@@ -11,6 +11,11 @@ const habitSchema = new mongoose.Schema({
         required: true,
         trim: true
     },
+    rules: {
+        type: String,
+        default: '',
+        trim: true
+    },
     color: {
         type: String,
         default: '#4F46E5' // Default indigo-ish
@@ -18,6 +23,15 @@ const habitSchema = new mongoose.Schema({
     // We prefer storing dates as "YYYY-MM-DD" strings for easy unique checking
     completedDates: {
         type: [String],
+        default: []
+    },
+    // Tracks dates that already granted XP with timestamps (for undo window)
+    // Format: [{ date: "YYYY-MM-DD", grantedAt: Date }]
+    xpGrantedDates: {
+        type: [{
+            date: String,
+            grantedAt: { type: Date, default: Date.now }
+        }],
         default: []
     },
     currentStreak: {
