@@ -48,16 +48,16 @@ const calculateLevel = (xp) => {
 // --- ROUTES ---
 
 // Health Check
-app.get('/api', (req, res) => {
+app.get('/', (req, res) => {
     res.json({ status: 'ok', message: 'Monster API is running!' });
 });
 
-app.get('/api/health', (req, res) => {
+app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // 1. REGISTER
-app.post('/api/register', async (req, res) => {
+app.post('/register', async (req, res) => {
     try {
         const { email, password } = req.body;
         const user = new User({ email, password });
@@ -69,7 +69,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // 2. LOGIN
-app.post('/api/login', async (req, res) => {
+app.post('/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         const user = await User.findOne({ email, password });
@@ -81,7 +81,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // 3. GET HABITS (Sync)
-app.get('/api/habits', async (req, res) => {
+app.get('/habits', async (req, res) => {
     const { userId } = req.query;
     try {
         const visibleHabits = await Habit.find({
@@ -96,7 +96,7 @@ app.get('/api/habits', async (req, res) => {
 });
 
 // 4. CREATE HABIT
-app.post('/api/habits', async (req, res) => {
+app.post('/habits', async (req, res) => {
     try {
         const { partnerId, battleDuration, ...habitData } = req.body;
 
@@ -136,7 +136,7 @@ app.post('/api/habits', async (req, res) => {
 });
 
 // 5. TOGGLE HABIT DATE
-app.post('/api/habits/:id/toggle', async (req, res) => {
+app.post('/habits/:id/toggle', async (req, res) => {
     const { date } = req.body;
     const { id } = req.params;
 
@@ -179,7 +179,7 @@ app.post('/api/habits/:id/toggle', async (req, res) => {
 });
 
 // 6. UPDATE HABIT
-app.put('/api/habits/:id', async (req, res) => {
+app.put('/habits/:id', async (req, res) => {
     try {
         const habit = await Habit.findByIdAndUpdate(req.params.id, req.body, { new: true });
         res.json(habit);
@@ -189,7 +189,7 @@ app.put('/api/habits/:id', async (req, res) => {
 });
 
 // 7. DELETE HABIT
-app.delete('/api/habits/:id', async (req, res) => {
+app.delete('/habits/:id', async (req, res) => {
     try {
         await Habit.findByIdAndDelete(req.params.id);
         res.json({ message: 'Deleted' });
@@ -199,7 +199,7 @@ app.delete('/api/habits/:id', async (req, res) => {
 });
 
 // 8. HELL WEEK ACTIONS
-app.post('/api/user/:userId/hell-week', async (req, res) => {
+app.post('/user/:userId/hell-week', async (req, res) => {
     const { action } = req.body;
     const { userId } = req.params;
 
@@ -228,7 +228,7 @@ app.post('/api/user/:userId/hell-week', async (req, res) => {
 });
 
 // 9. GET USER DETAILS
-app.get('/api/user/:id', async (req, res) => {
+app.get('/user/:id', async (req, res) => {
     try {
         const user = await User.findById(req.params.id);
         if (!user) return res.status(404).json({ error: 'User not found' });
@@ -253,7 +253,7 @@ app.get('/api/user/:id', async (req, res) => {
 // --- SOCIAL ROUTES ---
 
 // 10. SEND FRIEND REQUEST
-app.post('/api/social/add-friend', async (req, res) => {
+app.post('/social/add-friend', async (req, res) => {
     const { userId, friendCode } = req.body;
 
     try {
@@ -277,7 +277,7 @@ app.post('/api/social/add-friend', async (req, res) => {
 });
 
 // 11. HANDLE FRIEND REQUEST
-app.post('/api/social/handle-request', async (req, res) => {
+app.post('/social/handle-request', async (req, res) => {
     const { userId, requesterId, action } = req.body;
 
     try {
@@ -302,7 +302,7 @@ app.post('/api/social/handle-request', async (req, res) => {
 });
 
 // 12. GET FRIENDS WITH STATS
-app.get('/api/social/friends', async (req, res) => {
+app.get('/social/friends', async (req, res) => {
     const { userId } = req.query;
     try {
         const user = await User.findById(userId).populate('friends', 'email level platformXp monsterType hellWeek');
@@ -353,7 +353,7 @@ app.get('/api/social/friends', async (req, res) => {
 });
 
 // 13. GET REQUESTS
-app.get('/api/social/requests', async (req, res) => {
+app.get('/social/requests', async (req, res) => {
     const { userId } = req.query;
     try {
         const user = await User.findById(userId).populate('friendRequests.from', 'email level');
@@ -378,7 +378,7 @@ app.get('/api/social/requests', async (req, res) => {
 });
 
 // 14. GET SHARED HABIT GROUP
-app.get('/api/habits/shared/:groupId', async (req, res) => {
+app.get('/habits/shared/:groupId', async (req, res) => {
     try {
         const habits = await Habit.find({ sharedGroupId: req.params.groupId })
             .populate('userId', 'email level monsterType');
@@ -391,7 +391,7 @@ app.get('/api/habits/shared/:groupId', async (req, res) => {
 // --- BATTLE ROUTES ---
 
 // Get Pending Battle Requests
-app.get('/api/battles/requests', async (req, res) => {
+app.get('/battles/requests', async (req, res) => {
     const { userId } = req.query;
     try {
         const requests = await Habit.find({
@@ -406,7 +406,7 @@ app.get('/api/battles/requests', async (req, res) => {
 });
 
 // Respond to Battle Request
-app.post('/api/battles/respond', async (req, res) => {
+app.post('/battles/respond', async (req, res) => {
     const { habitId, action } = req.body;
     try {
         const myHabit = await Habit.findById(habitId);
@@ -447,7 +447,7 @@ app.post('/api/battles/respond', async (req, res) => {
 });
 
 // Get Battles (Active & Past)
-app.get('/api/battles', async (req, res) => {
+app.get('/battles', async (req, res) => {
     const { userId } = req.query;
     try {
         const activeBattles = await Habit.find({ userId, type: 'battle', battleStatus: 'active' });
