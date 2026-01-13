@@ -4,6 +4,10 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const User = require('./models/User');
 const Habit = require('./models/Habit');
+const { Resend } = require('resend');
+
+// Initialize Resend with API Key from env
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -144,6 +148,76 @@ app.post('/login', async (req, res) => {
         }
 
         return res.status(401).json({ error: 'Invalid credentials' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 2.5 FORGOT PASSWORD
+app.post('/forgot-password', async (req, res) => {
+    const { email } = req.body;
+    try {
+        const user = await User.findOne({ email });
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        // Generate 6 digit code
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+        // Set expiry (10 mins)
+        user.resetCode = code;
+        user.resetCodeExpires = Date.now() + 10 * 60 * 1000;
+        await user.save();
+
+        if (!process.env.RESEND_API_KEY) {
+            console.log('⚠️ No RESEND_API_KEY found. Printing code to console:');
+            console.log(`RESET CODE for ${email}: ${code}`);
+            return res.json({ message: 'Code sent (Check server logs for dev mode)' });
+        }
+
+        await resend.emails.send({
+            from: 'Monster App <onboarding@resend.dev>', // Update this if you have a custom domain
+            to: email,
+            subject: 'Reset Your Monster Password',
+            html: `
+            <div style="background-color: #000000; color: #ffffff; padding: 40px; font-family: monospace; text-align: center;">
+              <div style="margin-bottom: 40px;">
+                <h1 style="color: #ffffff; font-size: 48px; letter-spacing: 8px; margin: 0; font-weight: 900; text-shadow: 0 0 10px #ffffff;">MONSTER</h1>
+              </div>
+              <div style="background-color: #111111; padding: 40px; border-radius: 0px; border: 1px solid #333333; display: inline-block; max-width: 400px; width: 100%;">
+                <p style="color: #aaaaaa; font-size: 16px; margin-bottom: 30px; line-height: 1.5;">You requested a password reset. Use the code below to complete the process.</p>
+                <div style="font-size: 42px; font-weight: bold; letter-spacing: 12px; color: #ffffff; margin: 30px 0; border: 2px solid #333; padding: 20px; background: #000;">${code}</div>
+                <p style="color: #555555; font-size: 12px; margin-top: 30px;">CODE EXPIRES IN 10 MINUTES</p>
+              </div>
+            </div>
+            `
+        });
+
+        res.json({ message: 'Code sent to email' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 2.6 RESET PASSWORD
+app.post('/reset-password', async (req, res) => {
+    const { email, code, newPassword } = req.body;
+    try {
+        const user = await User.findOne({
+            email,
+            resetCode: code,
+            resetCodeExpires: { $gt: Date.now() }
+        });
+
+        if (!user) return res.status(400).json({ error: 'Invalid or expired code' });
+
+        user.password = newPassword;
+        user.resetCode = undefined;
+        user.resetCodeExpires = undefined;
+        // User model pre-save hook handles hashing
+        await user.save();
+
+        res.json({ message: 'Password updated successfully' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
