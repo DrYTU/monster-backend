@@ -59,7 +59,16 @@ const userSchema = new mongoose.Schema({
     from: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     status: { type: String, enum: ['pending', 'rejected'], default: 'pending' },
     timestamp: { type: Date, default: Date.now }
-  }]
+  }],
+  // Password Reset
+  resetCode: {
+    type: String,
+    select: false
+  },
+  resetCodeExpires: {
+    type: Date,
+    select: false
+  }
 });
 
 // Hash password before saving
