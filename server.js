@@ -20,25 +20,47 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/monster_app
 const calculateStreak = (completedDates) => {
     if (!completedDates || completedDates.length === 0) return 0;
 
-    // Sort dates desc
-    const sorted = [...completedDates].sort((a, b) => new Date(b) - new Date(a));
-    const today = new Date().toISOString().split('T')[0];
-    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    // Filter valid dates, deduplicate, and sort descending
+    const sorted = [...new Set(completedDates)]
+        .filter(d => d) // Remove null/undefined
+        .sort((a, b) => new Date(b) - new Date(a));
 
+    if (sorted.length === 0) return 0;
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const yesterdayDate = new Date();
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const yesterdayStr = yesterdayDate.toISOString().split('T')[0];
+
+    const latestStr = sorted[0];
+
+    // If the latest completion is before yesterday, streak is broken.
+    if (latestStr < yesterdayStr) {
+        return 0;
+    }
+
+    // Calculate Streak
     let streak = 0;
-    let currentCheck = sorted[0] === today ? today : (sorted[0] === yesterday ? yesterday : null);
 
-    // If the last completion was before yesterday, streak is broken (0), 
-    // UNLESS we are calculating "current stats" and user just hasn't done it *today* yet, 
-    // but did it yesterday.
+    // We start checking from the latest completed date
+    // And move backwards 1 day at a time
+    let checkDate = new Date(latestStr);
 
-    // Simple logic: Iterative check backwards
-    // Note: This is a simplified calculation.
-    // Real apps might need timezone awareness.
+    for (const dateStr of sorted) {
+        // Generate string for checkDate to match "YYYY-MM-DD"
+        const checkDateStr = checkDate.toISOString().split('T')[0];
 
-    return sorted.length; // Placeholder for robust logic, strictly implementation logic serves basic need.
-    // Re-implementing correctly below in routes if needed or keeping simple counter for now.
-    // Actually, we'll rely on the client or a smarter update logic.
+        if (dateStr === checkDateStr) {
+            streak++;
+            // Move back 1 day
+            checkDate.setDate(checkDate.getDate() - 1);
+        } else {
+            // Gap found
+            break;
+        }
+    }
+
+    return streak;
 };
 
 // --- RPG HELPERS ---
@@ -61,13 +83,36 @@ const calculateLevel = (xp) => {
 // 1. REGISTER
 app.post('/register', async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const { email, password, firstName, lastName } = req.body;
         // Password hashing is handled in User model pre-save hook
-        const user = new User({ email, password });
+        const user = new User({
+            email,
+            password,
+            firstName: firstName || '',
+            lastName: lastName || ''
+        });
         await user.save();
         res.status(201).json({ user, message: 'User created' });
     } catch (err) {
         res.status(400).json({ error: err.message });
+    }
+});
+
+// 1.5 UPDATE USER PROFILE
+app.put('/user/:id', async (req, res) => {
+    try {
+        const { firstName, lastName } = req.body;
+        const user = await User.findById(req.params.id);
+
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        if (firstName !== undefined) user.firstName = firstName;
+        if (lastName !== undefined) user.lastName = lastName;
+
+        await user.save();
+        res.json(user);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -108,35 +153,26 @@ app.post('/login', async (req, res) => {
 app.get('/habits', async (req, res) => {
     const { userId } = req.query;
     try {
-        // Only show visible habits (hide pending battle invites)
-        const habits = await Habit.find({
-            userId,
-            isVisible: { $ne: false },
-            type: { $ne: 'battle' } // Also hide active battles? Only if we want them ONLY in Battle Screen.
-            // User requested: "O süre dolunca ilgili habit, menüde oluşturacağımız yeni battle sekmesine taşınsın."
-            // This implies ACTIVE battles might be on Home Screen, or ONLY on Battle Screen.
-            // "Kabul edene kadar soluk gözüksün... Kabul edecek taraf da bunu sosyal kısmında onaylayabilsin"
-            // "Böylece ikisine de ortak bir habit eklenmiş olur." -> This implies it should appear in habits list too?
-            // "O süre dolunca ilgili habit... battle sekmesine taşınsın" -> Completed battles move. Active battles stay?
-            // "Battle sekmesinde geçmiş battle'ları görebilelim... Battle'ın adı skorları vs. gibi."
-            // Usually, battles are habits you check off daily. So they should probably be on Home Screen too for easy access.
-            // Let's keep them on Home Screen if they are active.
-        });
-
-        // Revised Query: Show all Visible habits.
-        // Pending battles are isVisible: false (for receiver).
-        // Waiting battles are isVisible: true (for creator).
-        // Active battles are isVisible: true.
-        // Completed battles -> Should be moved to history? User said "moved to battle tab".
-        // So Completed battles should NOT show here.
-
+        // Only show visible habits
         const visibleHabits = await Habit.find({
             userId,
             isVisible: { $ne: false },
             battleStatus: { $ne: 'completed' } // Hide completed battles from Home
         });
 
-        res.json(visibleHabits);
+        // Recalculate streaks dynamically to ensure accuracy
+        const checkedHabits = await Promise.all(visibleHabits.map(async (h) => {
+            const realStreak = calculateStreak(h.completedDates);
+
+            // If DB value is stale, update it
+            if (h.currentStreak !== realStreak) {
+                h.currentStreak = realStreak;
+                await h.save();
+            }
+            return h;
+        }));
+
+        res.json(checkedHabits);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -237,7 +273,8 @@ app.post('/habits/:id/toggle', async (req, res) => {
         }
 
         habit.completedDates.sort();
-        habit.currentStreak = habit.completedDates.length; // Simplified logic
+        // Recalculate streak using robust logic
+        habit.currentStreak = calculateStreak(habit.completedDates);
 
         await habit.save();
 
@@ -581,7 +618,8 @@ app.get('/social/friends', async (req, res) => {
             let totalHabits = habits.length;
 
             habits.forEach(h => {
-                const current = h.currentStreak || 0;
+                // Use dynamic calculation to be accurate
+                const current = calculateStreak(h.completedDates);
                 if (current > maxCurrentStreak) maxCurrentStreak = current;
 
                 const daysExist = Math.max(1, Math.floor((new Date() - new Date(h.createdAt)) / (1000 * 60 * 60 * 24)));
