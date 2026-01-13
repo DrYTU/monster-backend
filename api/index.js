@@ -7,7 +7,8 @@ const Habit = require('../models/Habit');
 const { Resend } = require('resend');
 
 // Initialize Resend with API Key from env
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Initialize Resend with API Key from env
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const app = express();
 
@@ -191,10 +192,9 @@ app.post('/forgot-password', async (req, res) => {
         user.resetCodeExpires = Date.now() + 10 * 60 * 1000;
         await user.save();
 
-        if (!process.env.RESEND_API_KEY) {
-            console.log('⚠️ No RESEND_API_KEY found. Printing code to console:');
-            console.log(`RESET CODE for ${email}: ${code}`);
-            return res.json({ message: 'Code sent (Check server logs for dev mode)' });
+        if (!resend) {
+            console.log('⚠️ No RESEND_API_KEY configured.');
+            return res.status(500).json({ error: 'Email service not configured on server' });
         }
 
         await resend.emails.send({
