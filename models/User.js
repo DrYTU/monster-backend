@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
 
 const userSchema = new mongoose.Schema({
   email: {
@@ -50,6 +51,23 @@ const userSchema = new mongoose.Schema({
     timestamp: { type: Date, default: Date.now }
   }]
 });
+
+// Hash password before saving
+userSchema.pre('save', async function () {
+  if (!this.isModified('password')) return;
+
+  try {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+  } catch (err) {
+    throw new Error(err);
+  }
+});
+
+// Compare password method
+userSchema.methods.comparePassword = async function (candidatePassword) {
+  return bcrypt.compare(candidatePassword, this.password);
+};
 
 // Generate Friend Code pre-save
 userSchema.pre('save', async function () {

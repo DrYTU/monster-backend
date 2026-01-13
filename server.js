@@ -41,7 +41,6 @@ const calculateStreak = (completedDates) => {
     // Actually, we'll rely on the client or a smarter update logic.
 };
 
-
 // --- RPG HELPERS ---
 const LEVEL_THRESHOLDS = [0, 100, 300, 600, 1000, 1500, 2100, 2800, 3600, 5000, 10000, 20000];
 
@@ -63,7 +62,7 @@ const calculateLevel = (xp) => {
 app.post('/register', async (req, res) => {
     try {
         const { email, password } = req.body;
-        // In production, Hash password here (bcrypt)
+        // Password hashing is handled in User model pre-save hook
         const user = new User({ email, password });
         await user.save();
         res.status(201).json({ user, message: 'User created' });
@@ -76,9 +75,30 @@ app.post('/register', async (req, res) => {
 app.post('/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        const user = await User.findOne({ email, password }); // In prod, check hash
+        // Find by email only first
+        const user = await User.findOne({ email });
         if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-        res.json({ user });
+
+        // 1. Check if password matches (using bcrypt)
+        const isMatch = await user.comparePassword(password);
+
+        if (isMatch) {
+            return res.json({ user });
+        }
+
+        // 2. Fallback: Migration for legacy plain-text passwords
+        // Check if stored password looks like a hash (starts with $2)
+        const isHashed = user.password.startsWith('$2');
+        if (!isHashed && user.password === password) {
+            console.log(`Migrating legacy password for user: ${email}`);
+            // Force hash update
+            user.password = password;
+            user.markModified('password');
+            await user.save();
+            return res.json({ user });
+        }
+
+        return res.status(401).json({ error: 'Invalid credentials' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
