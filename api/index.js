@@ -30,6 +30,53 @@ app.use(async (req, res, next) => {
     next();
 });
 
+// --- HELPERS ---
+const calculateStreak = (completedDates) => {
+    if (!completedDates || completedDates.length === 0) return 0;
+
+    // Filter valid dates, deduplicate, and sort descending
+    const sorted = [...new Set(completedDates)]
+        .filter(d => d) // Remove null/undefined
+        .sort((a, b) => new Date(b) - new Date(a));
+
+    if (sorted.length === 0) return 0;
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const yesterdayDate = new Date();
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const yesterdayStr = yesterdayDate.toISOString().split('T')[0];
+
+    const latestStr = sorted[0];
+
+    // If the latest completion is before yesterday, streak is broken.
+    if (latestStr < yesterdayStr) {
+        return 0;
+    }
+
+    // Calculate Streak
+    let streak = 0;
+
+    // We start checking from the latest completed date
+    // And move backwards 1 day at a time
+    let checkDate = new Date(latestStr);
+
+    for (const dateStr of sorted) {
+        // Generate string for checkDate to match "YYYY-MM-DD"
+        const checkDateStr = checkDate.toISOString().split('T')[0];
+
+        if (dateStr === checkDateStr) {
+            streak++;
+            // Move back 1 day
+            checkDate.setDate(checkDate.getDate() - 1);
+        } else {
+            // Gap found
+            break;
+        }
+    }
+
+    return streak;
+};
+
 // --- RPG HELPERS ---
 const LEVEL_THRESHOLDS = [0, 100, 300, 600, 1000, 1500, 2100, 2800, 3600, 5000, 10000, 20000];
 
@@ -49,7 +96,7 @@ const calculateLevel = (xp) => {
 
 // Health Check
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', message: 'Monster API is running!' });
+    res.json({ status: 'ok', message: 'Monster API is running with synchronized codebase!' });
 });
 
 app.get('/health', (req, res) => {
@@ -59,8 +106,14 @@ app.get('/health', (req, res) => {
 // 1. REGISTER
 app.post('/register', async (req, res) => {
     try {
-        const { email, password } = req.body;
-        const user = new User({ email, password });
+        const { email, password, firstName, lastName } = req.body;
+        // Password hashing is handled in User model pre-save hook
+        const user = new User({
+            email,
+            password,
+            firstName: firstName || '',
+            lastName: lastName || ''
+        });
         await user.save();
         res.status(201).json({ user, message: 'User created' });
     } catch (err) {
@@ -68,13 +121,52 @@ app.post('/register', async (req, res) => {
     }
 });
 
+// 1.5 UPDATE USER PROFILE
+app.put('/user/:id', async (req, res) => {
+    try {
+        const { firstName, lastName } = req.body;
+        const user = await User.findById(req.params.id);
+
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        if (firstName !== undefined) user.firstName = firstName;
+        if (lastName !== undefined) user.lastName = lastName;
+
+        await user.save();
+        res.json(user);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // 2. LOGIN
 app.post('/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        const user = await User.findOne({ email, password });
+        // Find by email only first
+        const user = await User.findOne({ email });
         if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-        res.json({ user });
+
+        // 1. Check if password matches (using bcrypt)
+        const isMatch = await user.comparePassword(password);
+
+        if (isMatch) {
+            return res.json({ user });
+        }
+
+        // 2. Fallback: Migration for legacy plain-text passwords
+        // Check if stored password looks like a hash (starts with $2)
+        const isHashed = user.password.startsWith('$2');
+        if (!isHashed && user.password === password) {
+            console.log(`Migrating legacy password for user: ${email}`);
+            // Force hash update
+            user.password = password;
+            user.markModified('password');
+            await user.save();
+            return res.json({ user });
+        }
+
+        return res.status(401).json({ error: 'Invalid credentials' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -84,18 +176,32 @@ app.post('/login', async (req, res) => {
 app.get('/habits', async (req, res) => {
     const { userId } = req.query;
     try {
+        // Only show visible habits
         const visibleHabits = await Habit.find({
             userId,
             isVisible: { $ne: false },
-            battleStatus: { $ne: 'completed' }
+            battleStatus: { $ne: 'completed' } // Hide completed battles from Home
         });
-        res.json(visibleHabits);
+
+        // Recalculate streaks dynamically to ensure accuracy
+        const checkedHabits = await Promise.all(visibleHabits.map(async (h) => {
+            const realStreak = calculateStreak(h.completedDates);
+
+            // If DB value is stale, update it
+            if (h.currentStreak !== realStreak) {
+                h.currentStreak = realStreak;
+                await h.save();
+            }
+            return h;
+        }));
+
+        res.json(checkedHabits);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// 4. CREATE HABIT
+// 4. CREATE HABIT (Updated for Social)
 app.post('/habits', async (req, res) => {
     try {
         const { partnerId, battleDuration, ...habitData } = req.body;
@@ -105,6 +211,7 @@ app.post('/habits', async (req, res) => {
             sharedGroupId = new mongoose.Types.ObjectId().toString();
         }
 
+        // Create Main Habit (Creator)
         const habit = new Habit({
             ...habitData,
             partnerId: partnerId || null,
@@ -116,15 +223,16 @@ app.post('/habits', async (req, res) => {
         });
         await habit.save();
 
+        // If Partner exists, send Battle Invite (Hidden initially)
         if (partnerId) {
             const partnerHabit = new Habit({
                 ...habitData,
                 userId: partnerId,
-                partnerId: habitData.userId,
+                partnerId: habitData.userId, // The creator becomes the partner
                 sharedGroupId,
                 type: 'battle',
-                battleStatus: 'pending',
-                isVisible: false,
+                battleStatus: 'pending', // Waiting for acceptance
+                isVisible: false, // Hidden until accepted
                 battleDuration: battleDuration || 7
             });
             await partnerHabit.save();
@@ -138,7 +246,7 @@ app.post('/habits', async (req, res) => {
 
 // 5. TOGGLE HABIT DATE
 app.post('/habits/:id/toggle', async (req, res) => {
-    const { date } = req.body;
+    const { date } = req.body; // YYYY-MM-DD
     const { id } = req.params;
     const UNDO_WINDOW_MS = 60 * 1000; // 60 seconds undo window
 
@@ -188,12 +296,15 @@ app.post('/habits/:id/toggle', async (req, res) => {
         }
 
         habit.completedDates.sort();
-        habit.currentStreak = habit.completedDates.length;
+        // Recalculate streak using robust logic
+        habit.currentStreak = calculateStreak(habit.completedDates);
 
         await habit.save();
 
+        // Update User XP
         const user = await User.findById(habit.userId);
         if (user && xpChange !== 0) {
+            // Hell Week Multiplier
             if (user.hellWeek?.isActive) {
                 xpChange = xpChange > 0 ? (xpChange + 20) : (xpChange - 20);
             }
@@ -210,29 +321,9 @@ app.post('/habits/:id/toggle', async (req, res) => {
     }
 });
 
-// 6. UPDATE HABIT
-app.put('/habits/:id', async (req, res) => {
-    try {
-        const habit = await Habit.findByIdAndUpdate(req.params.id, req.body, { new: true });
-        res.json(habit);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 7. DELETE HABIT
-app.delete('/habits/:id', async (req, res) => {
-    try {
-        await Habit.findByIdAndDelete(req.params.id);
-        res.json({ message: 'Deleted' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
 // 8. HELL WEEK ACTIONS
 app.post('/user/:userId/hell-week', async (req, res) => {
-    const { action } = req.body;
+    const { action } = req.body; // 'start' or 'surrender'
     const { userId } = req.params;
 
     try {
@@ -246,7 +337,7 @@ app.post('/user/:userId/hell-week', async (req, res) => {
             user.hellWeek = {
                 isActive: true,
                 startDate: new Date(),
-                targetDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+                targetDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days later
             };
             await user.save();
             res.json({ message: 'Welcome to Hell.', hellWeek: user.hellWeek });
@@ -275,152 +366,21 @@ app.post('/user/:userId/hell-week', async (req, res) => {
     }
 });
 
-// 9. GET USER DETAILS
-app.get('/user/:id', async (req, res) => {
+// 6. UPDATE HABIT
+app.put('/habits/:id', async (req, res) => {
     try {
-        const user = await User.findById(req.params.id);
-        if (!user) return res.status(404).json({ error: 'User not found' });
-
-        if (!user.friendCode) {
-            await user.save();
-        }
-
-        const calculatedLevel = calculateLevel(user.platformXp || 0);
-        // Only increase level, never decrease (level is permanent once earned)
-        if (calculatedLevel > (user.level || 1)) {
-            console.log(`Leveling up user: ${user.level} -> ${calculatedLevel} for XP ${user.platformXp}`);
-            user.level = calculatedLevel;
-            await user.save();
-        }
-
-        res.json(user);
+        const habit = await Habit.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        res.json(habit);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// --- SOCIAL ROUTES ---
-
-// 10. SEND FRIEND REQUEST
-app.post('/social/add-friend', async (req, res) => {
-    const { userId, friendCode } = req.body;
-
+// 7. DELETE HABIT
+app.delete('/habits/:id', async (req, res) => {
     try {
-        const sender = await User.findById(userId);
-        const target = await User.findOne({ friendCode: friendCode?.toUpperCase() });
-
-        if (!target) return res.status(404).json({ error: 'User not found with this code.' });
-        if (sender.id === target.id) return res.status(400).json({ error: 'You cannot add yourself.' });
-        if (sender.friends.includes(target.id)) return res.status(400).json({ error: 'Already friends.' });
-
-        const existingReq = target.friendRequests.find(r => r.from.toString() === userId);
-        if (existingReq) return res.status(400).json({ error: 'Request already sent.' });
-
-        target.friendRequests.push({ from: userId, status: 'pending' });
-        await target.save();
-
-        res.json({ message: 'Friend request sent!' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 11. HANDLE FRIEND REQUEST
-app.post('/social/handle-request', async (req, res) => {
-    const { userId, requesterId, action } = req.body;
-
-    try {
-        const user = await User.findById(userId);
-        const requester = await User.findById(requesterId);
-
-        if (!user || !requester) return res.status(404).json({ error: 'User not found' });
-
-        user.friendRequests = user.friendRequests.filter(r => r.from.toString() !== requesterId);
-
-        if (action === 'accept') {
-            if (!user.friends.includes(requesterId)) user.friends.push(requesterId);
-            if (!requester.friends.includes(userId)) requester.friends.push(userId);
-            await requester.save();
-        }
-
-        await user.save();
-        res.json({ message: `Request ${action}ed`, friends: user.friends });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 12. GET FRIENDS WITH STATS
-app.get('/social/friends', async (req, res) => {
-    const { userId } = req.query;
-    try {
-        const user = await User.findById(userId).populate('friends', 'email level platformXp monsterType hellWeek');
-        if (!user) return res.status(404).json({ error: 'User not found' });
-
-        const friendsData = [];
-
-        for (const friend of user.friends) {
-            const habits = await Habit.find({ userId: friend._id });
-
-            let totalPossibleDays = 0;
-            let totalCompletedCount = 0;
-            let maxCurrentStreak = 0;
-            let totalHabits = habits.length;
-
-            habits.forEach(h => {
-                const current = h.currentStreak || 0;
-                if (current > maxCurrentStreak) maxCurrentStreak = current;
-
-                const daysExist = Math.max(1, Math.floor((new Date() - new Date(h.createdAt)) / (1000 * 60 * 60 * 24)));
-                const completedLen = h.completedDates?.length || 0;
-
-                totalPossibleDays += daysExist;
-                totalCompletedCount += Math.min(completedLen, daysExist);
-            });
-
-            const completionRate = totalPossibleDays > 0 ? Math.round((totalCompletedCount / totalPossibleDays) * 100) : 0;
-
-            friendsData.push({
-                _id: friend._id,
-                email: friend.email,
-                level: friend.level,
-                xp: friend.platformXp,
-                monsterType: friend.monsterType,
-                hellWeek: friend.hellWeek,
-                stats: {
-                    totalHabits,
-                    currentStreak: maxCurrentStreak,
-                    completionRate
-                }
-            });
-        }
-
-        res.json(friendsData);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 13. GET REQUESTS
-app.get('/social/requests', async (req, res) => {
-    const { userId } = req.query;
-    try {
-        const user = await User.findById(userId).populate('friendRequests.from', 'email level');
-        if (!user) return res.status(404).json({ error: 'User not found' });
-
-        const requests = user.friendRequests
-            .filter(r => r.status === 'pending' && r.from)
-            .map(r => ({
-                _id: r._id,
-                from: {
-                    _id: r.from._id,
-                    email: r.from.email,
-                    level: r.from.level
-                },
-                timestamp: r.timestamp
-            }));
-
-        res.json(requests);
+        await Habit.findByIdAndDelete(req.params.id);
+        res.json({ message: 'Deleted' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -493,7 +453,7 @@ app.post('/battles/cancel', async (req, res) => {
 
 // Respond to Battle Request
 app.post('/battles/respond', async (req, res) => {
-    const { habitId, action } = req.body;
+    const { habitId, action } = req.body; // action: 'accept' | 'reject'
     try {
         const myHabit = await Habit.findById(habitId);
         if (!myHabit) return res.status(404).json({ error: 'Battle not found' });
@@ -505,14 +465,16 @@ app.post('/battles/respond', async (req, res) => {
 
         if (action === 'accept') {
             const startDate = new Date();
+            // Activate mine
             myHabit.battleStatus = 'active';
             myHabit.isVisible = true;
             myHabit.battleStartDate = startDate;
 
+            // Activate opponent
             if (opponentHabit) {
                 opponentHabit.battleStatus = 'active';
                 opponentHabit.isVisible = true; // Show in Home screen
-                opponentHabit.battleStartDate = startDate;
+                opponentHabit.battleStartDate = startDate; // Sync start time
                 await opponentHabit.save();
             }
 
@@ -520,8 +482,10 @@ app.post('/battles/respond', async (req, res) => {
             res.json({ message: 'Battle Accepted!', habit: myHabit });
 
         } else if (action === 'reject') {
+            // Delete mine
             await Habit.findByIdAndDelete(habitId);
 
+            // Notify opponent (set to rejected)
             if (opponentHabit) {
                 opponentHabit.battleStatus = 'rejected';
                 await opponentHabit.save();
@@ -545,7 +509,7 @@ app.post('/battles/surrender', async (req, res) => {
             _id: { $ne: myHabit._id }
         });
 
-        // Current user surrenders, so myHabit loses
+        // Current user surrenders, so myHabit loses and opponent wins
         myHabit.battleStatus = 'completed';
         myHabit.battleWinner = myHabit.partnerId; // Partner wins
 
@@ -557,10 +521,9 @@ app.post('/battles/surrender', async (req, res) => {
 
         await myHabit.save();
 
-        // Also add penalty to user (optional, but requested for Hell Week? No, this is for battles)
         const user = await User.findById(myHabit.userId);
         if (user) {
-            user.platformXp = Math.max(0, (user.platformXp || 0) - 100); // 100 XP penalty for surrendering a battle
+            user.platformXp = Math.max(0, (user.platformXp || 0) - 100);
             await user.save();
         }
 
@@ -574,6 +537,7 @@ app.post('/battles/surrender', async (req, res) => {
 app.get('/battles', async (req, res) => {
     const { userId } = req.query;
     try {
+        // 1. Check for expired active battles
         const activeBattles = await Habit.find({ userId, type: 'battle', battleStatus: 'active' });
         const now = new Date();
 
@@ -582,13 +546,17 @@ app.get('/battles', async (req, res) => {
                 const endDate = new Date(battle.battleStartDate);
                 endDate.setDate(endDate.getDate() + battle.battleDuration);
 
+                // If expired
                 if (now > endDate) {
                     battle.battleStatus = 'completed';
+                    // Determine Winner logic could go here, but for now just mark completed
+                    // We can calc results on the fly or save them
                     await battle.save();
                 }
             }
         }
 
+        // 2. Fetch all battles (active and completed)
         const battles = await Habit.find({
             userId,
             type: 'battle',
@@ -596,6 +564,163 @@ app.get('/battles', async (req, res) => {
         }).populate('partnerId', 'email level');
 
         res.json(battles);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- SOCIAL ROUTES ---
+
+// 10. SEND FRIEND REQUEST
+app.post('/social/add-friend', async (req, res) => {
+    const { userId, friendCode } = req.body;
+
+    try {
+        const sender = await User.findById(userId);
+        const target = await User.findOne({ friendCode: friendCode?.toUpperCase() });
+
+        if (!target) return res.status(404).json({ error: 'User not found with this code.' });
+        if (sender.id === target.id) return res.status(400).json({ error: 'You cannot add yourself.' });
+        if (sender.friends.includes(target.id)) return res.status(400).json({ error: 'Already friends.' });
+
+        // Check pending
+        const existingReq = target.friendRequests.find(r => r.from.toString() === userId);
+        if (existingReq) return res.status(400).json({ error: 'Request already sent.' });
+
+        target.friendRequests.push({ from: userId, status: 'pending' });
+        await target.save();
+
+        res.json({ message: 'Friend request sent!' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 11. HANDLE FRIEND REQUEST
+app.post('/social/handle-request', async (req, res) => {
+    const { userId, requesterId, action } = req.body; // action: 'accept' | 'reject'
+
+    try {
+        const user = await User.findById(userId);
+        const requester = await User.findById(requesterId);
+
+        if (!user || !requester) return res.status(404).json({ error: 'User not found' });
+
+        // Remove request
+        user.friendRequests = user.friendRequests.filter(r => r.from.toString() !== requesterId);
+
+        if (action === 'accept') {
+            if (!user.friends.includes(requesterId)) user.friends.push(requesterId);
+            if (!requester.friends.includes(userId)) requester.friends.push(userId);
+            await requester.save();
+        }
+
+        await user.save();
+        res.json({ message: `Request ${action}ed`, friends: user.friends });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 12. GET FRIENDS WITH STATS
+app.get('/social/friends', async (req, res) => {
+    const { userId } = req.query;
+    try {
+        const user = await User.findById(userId).populate('friends', 'email level platformXp monsterType hellWeek');
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        const friendsData = [];
+
+        for (const friend of user.friends) {
+            // Aggregate Habits Stats
+            const habits = await Habit.find({ userId: friend._id });
+
+            let totalPossibleDays = 0;
+            let totalCompletedCount = 0;
+            let maxCurrentStreak = 0;
+            let totalHabits = habits.length;
+
+            habits.forEach(h => {
+                // Use dynamic calculation to be accurate
+                const current = calculateStreak(h.completedDates);
+                if (current > maxCurrentStreak) maxCurrentStreak = current;
+
+                const daysExist = Math.max(1, Math.floor((new Date() - new Date(h.createdAt)) / (1000 * 60 * 60 * 24)));
+                const completedLen = h.completedDates?.length || 0;
+
+                totalPossibleDays += daysExist;
+                totalCompletedCount += Math.min(completedLen, daysExist); // Cap at max possible
+            });
+
+            const completionRate = totalPossibleDays > 0 ? Math.round((totalCompletedCount / totalPossibleDays) * 100) : 0;
+
+            friendsData.push({
+                _id: friend._id,
+                email: friend.email,
+                level: friend.level,
+                xp: friend.platformXp,
+                monsterType: friend.monsterType,
+                hellWeek: friend.hellWeek,
+                stats: {
+                    totalHabits,
+                    currentStreak: maxCurrentStreak,
+                    completionRate
+                }
+            });
+        }
+
+        res.json(friendsData);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 13. GET REQUESTS
+app.get('/social/requests', async (req, res) => {
+    const { userId } = req.query;
+    try {
+        const user = await User.findById(userId).populate('friendRequests.from', 'email level');
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        // Filter valid requests (pending) and map to clean object
+        const requests = user.friendRequests
+            .filter(r => r.status === 'pending' && r.from) // Check r.from exists (populated)
+            .map(r => ({
+                _id: r._id,
+                from: {
+                    _id: r.from._id,
+                    email: r.from.email,
+                    level: r.from.level
+                },
+                timestamp: r.timestamp
+            }));
+
+        res.json(requests);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 9. GET USER DETAILS
+app.get('/user/:id', async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        // Auto-generate friend code for existing users if missing
+        if (!user.friendCode) {
+            await user.save(); // Triggers pre-save hook
+        }
+
+        // Self-healing: Only increase level, never decrease (level is permanent once earned)
+        const calculatedLevel = calculateLevel(user.platformXp || 0);
+        if (calculatedLevel > (user.level || 1)) {
+            console.log(`Leveling up user: ${user.level} -> ${calculatedLevel} for XP ${user.platformXp}`);
+            user.level = calculatedLevel;
+            await user.save();
+        }
+
+        res.json(user);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
